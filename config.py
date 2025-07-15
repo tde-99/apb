@@ -10,6 +10,8 @@ BATCH_DELAY = 0.5      # Delay between files in a batch
 DELETE_DELAY = 0.3     # Delay between message deletions
 
 # Database settings
+MONGO_URI = "mongodb://localhost:27017/"
+MONGO_DB_NAME = "autoposter"
 DATABASE_PATH = "autoposter.db"
 
 # Job limits

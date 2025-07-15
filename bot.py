@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import sqlite3
 import json
 import re
 from datetime import datetime, timedelta, timezone # Import timezone
@@ -38,16 +37,20 @@ def load_config():
     config['FORCE_SUB_CHANNEL_ID'] = os.getenv('FORCE_SUB_CHANNEL_ID')
     admin_ids_str = os.getenv('ADMIN_IDS')
     config['ADMIN_IDS'] = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip()] if admin_ids_str else []
-    
+    config['MONGO_URI'] = os.getenv('MONGO_URI')
+    config['MONGO_DB_NAME'] = os.getenv('MONGO_DB_NAME')
+
     # If not found in env vars, try to load from config.py
-    if not all([config['API_ID'], config['API_HASH'], config['BOT_TOKEN']]):
+    if not all([config['API_ID'], config['API_HASH'], config['BOT_TOKEN'], config['MONGO_URI'], config['MONGO_DB_NAME']]):
         try:
-            from config import API_ID, API_HASH, BOT_TOKEN, FORCE_SUB_CHANNEL_ID, ADMIN_IDS
+            from config import API_ID, API_HASH, BOT_TOKEN, FORCE_SUB_CHANNEL_ID, ADMIN_IDS, MONGO_URI, MONGO_DB_NAME
             config['API_ID'] = config['API_ID'] or API_ID
             config['API_HASH'] = config['API_HASH'] or API_HASH
             config['BOT_TOKEN'] = config['BOT_TOKEN'] or BOT_TOKEN
             config['FORCE_SUB_CHANNEL_ID'] = config['FORCE_SUB_CHANNEL_ID'] or FORCE_SUB_CHANNEL_ID
             config['ADMIN_IDS'] = config['ADMIN_IDS'] or ADMIN_IDS
+            config['MONGO_URI'] = config['MONGO_URI'] or MONGO_URI
+            config['MONGO_DB_NAME'] = config['MONGO_DB_NAME'] or MONGO_DB_NAME
         except ImportError:
             pass
     
@@ -59,6 +62,10 @@ def load_config():
         missing.append('API_HASH')
     if not config['BOT_TOKEN']:
         missing.append('BOT_TOKEN')
+    if not config['MONGO_URI']:
+        missing.append('MONGO_URI')
+    if not config['MONGO_DB_NAME']:
+        missing.append('MONGO_DB_NAME')
     
     if missing:
         print("❌ Missing required configuration:")
@@ -94,6 +101,8 @@ API_HASH = CONFIG['API_HASH']
 BOT_TOKEN = CONFIG['BOT_TOKEN']
 FORCE_SUB_CHANNEL_ID = CONFIG['FORCE_SUB_CHANNEL_ID']
 ADMIN_IDS = CONFIG['ADMIN_IDS']
+MONGO_URI = CONFIG['MONGO_URI']
+MONGO_DB_NAME = CONFIG['MONGO_DB_NAME']
 
 # Rate limiting delays
 ADMIN_DELAY = 1.5
@@ -102,315 +111,7 @@ BATCH_DELAY = 0.5
 DELETE_DELAY = 1.0
 FORCE_SUB_CHECK_DELAY = 0.5 # Small delay for force sub check
 
-class Database:
-    def __init__(self):
-        self.db_path = 'autoposter.db'
-        self.init_db()
-    
-    def init_db(self):
-        """Initialize database tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                job_name TEXT NOT NULL,
-                source_channel_id TEXT NOT NULL,
-                target_channel_id TEXT NOT NULL,
-                start_post_id INTEGER NOT NULL,
-                end_post_id INTEGER NOT NULL,
-                batch_size INTEGER NOT NULL,
-                recurring_time INTEGER NOT NULL,
-                delete_time INTEGER NOT NULL,
-                filter_type TEXT NOT NULL,
-                custom_caption TEXT,
-                button_text TEXT,
-                button_url TEXT,
-                is_active BOOLEAN DEFAULT 0,
-                last_forwarded_id INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS forwarded_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id INTEGER NOT NULL,
-                original_message_id INTEGER NOT NULL,
-                forwarded_message_id INTEGER NOT NULL,
-                forwarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_states (
-                user_id INTEGER PRIMARY KEY,
-                state_data TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # New table for all unique users
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                first_interaction_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create indexes for better performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_active ON jobs(is_active)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_forwarded_job_id ON forwarded_messages(job_id)')
-        
-        conn.commit()
-        conn.close()
-    
-    def create_job(self, user_id: int, job_data: dict) -> int:
-        """Create a new forwarding job"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO jobs (
-                user_id, job_name, source_channel_id, target_channel_id,
-                start_post_id, end_post_id, batch_size, recurring_time,
-                delete_time, filter_type, custom_caption, button_text, button_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, job_data['name'], job_data['source'], job_data['target'],
-            job_data['start_id'], job_data['end_id'], job_data['batch_size'],
-            job_data['recurring_time'], job_data['delete_time'], job_data['filter_type'],
-            job_data.get('caption', ''), job_data.get('button_text', ''), 
-            job_data.get('button_url', '')
-        ))
-        
-        job_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return job_id
-    
-    def get_user_jobs(self, user_id: int) -> List[dict]:
-        """Get all jobs for a user"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC
-        ''', (user_id,))
-        
-        columns = [description[0] for description in cursor.description]
-        jobs = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        
-        conn.close()
-        return jobs
-    
-    def get_job(self, job_id: int) -> Optional[dict]:
-        """Get a specific job by ID"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM jobs WHERE id = ?', (job_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            columns = [description[0] for description in cursor.description]
-            job = dict(zip(columns, row))
-        else:
-            job = None
-        
-        conn.close()
-        return job
-    
-    def update_job_status(self, job_id: int, is_active: bool):
-        """Update job active status"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE jobs SET is_active = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        ''', (is_active, job_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def update_last_forwarded(self, job_id: int, message_id: int):
-        """Update the last forwarded message ID"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE jobs SET last_forwarded_id = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        ''', (message_id, job_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def add_forwarded_message(self, job_id: int, original_id: int, forwarded_id: int):
-        """Track a forwarded message"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO forwarded_messages (job_id, original_message_id, forwarded_message_id, forwarded_at)
-            VALUES (?, ?, ?, ?)
-        ''', (job_id, original_id, forwarded_id, datetime.utcnow().replace(tzinfo=timezone.utc))) # Ensure UTC
-        
-        conn.commit()
-        conn.close()
-    
-    def get_old_forwarded_messages(self, job_id: int, minutes_ago: int) -> List[int]:
-        """Get forwarded messages older than specified minutes"""
-        if minutes_ago <= 0:
-            return []
-            
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cutoff_time = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(minutes=minutes_ago) # Ensure UTC
-        
-        cursor.execute('''
-            SELECT forwarded_message_id FROM forwarded_messages 
-            WHERE job_id = ? AND forwarded_at < ?
-        ''', (job_id, cutoff_time))
-        
-        message_ids = [row[0] for row in cursor.fetchall()]
-        
-        # Clean up old records after getting IDs
-        cursor.execute('''
-            DELETE FROM forwarded_messages 
-            WHERE job_id = ? AND forwarded_at < ?
-        ''', (job_id, cutoff_time))
-        
-        conn.commit()
-        conn.close()
-        return message_ids
-    
-    def save_user_state(self, user_id: int, state_data: dict):
-        """Save user's current state"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO user_states (user_id, state_data, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, json.dumps(state_data)))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_user_state(self, user_id: int) -> Optional[dict]:
-        """Get user's current state"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT state_data FROM user_states WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-        
-        conn.close()
-        
-        if row:
-            return json.loads(row[0])
-        return None
-    
-    def clear_user_state(self, user_id: int):
-        """Clear user's state"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('DELETE FROM user_states WHERE user_id = ?', (user_id,))
-        
-        conn.commit()
-        conn.close()
-
-    def reset_job_progress(self, job_id: int, start_post_id: int):
-        """Reset the last forwarded message ID for a job"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Set last_forwarded_id to start_post_id - 1 to re-process from start_post_id
-        cursor.execute('''
-            UPDATE jobs SET last_forwarded_id = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        ''', (start_post_id - 1, job_id))
-        
-        # Also clear any tracked forwarded messages for this job to avoid re-deleting
-        cursor.execute('DELETE FROM forwarded_messages WHERE job_id = ?', (job_id,))
-        
-        conn.commit()
-        conn.close()
-
-    # --- New method to track all users ---
-    def add_user_if_not_exists(self, user_id: int):
-        """Add a user to the users table if they don't already exist."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('''
-                INSERT INTO users (user_id, first_interaction_at)
-                VALUES (?, ?)
-            ''', (user_id, datetime.utcnow().replace(tzinfo=timezone.utc)))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # User already exists, do nothing
-            pass
-        finally:
-            conn.close()
-
-    # --- Updated method for total users ---
-    def get_total_users(self) -> int:
-        """Get the total count of unique users who have interacted with the bot."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM users') # Query the new 'users' table
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
-    def get_total_jobs(self) -> int:
-        """Get the total count of all jobs created."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM jobs')
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
-    def get_total_forwarded_messages(self) -> int:
-        """Get the total count of all messages ever forwarded."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM forwarded_messages')
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
-    def get_jobs_created_today(self) -> int:
-        """Get the count of jobs created today (UTC)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        today_start_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        cursor.execute('SELECT COUNT(*) FROM jobs WHERE created_at >= ?', (today_start_utc,))
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
-    def get_forwarded_messages_today(self) -> int:
-        """Get the count of messages forwarded today (UTC)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        today_start_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        cursor.execute('SELECT COUNT(*) FROM forwarded_messages WHERE forwarded_at >= ?', (today_start_utc,))
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
+from database_mongo import Database
 
 class AutoposterBot:
     def __init__(self):
@@ -422,7 +123,7 @@ class AutoposterBot:
                 bot_token=BOT_TOKEN
             )
             
-            self.db = Database()
+            self.db = Database(mongo_uri=MONGO_URI, db_name=MONGO_DB_NAME)
             self.active_jobs = {}
             self.job_locks = {}
             self.force_sub_channel_id = FORCE_SUB_CHANNEL_ID
@@ -612,6 +313,8 @@ Forward posts between channels automatically."""
                 await self.handle_job_action(client, callback_query, data)
             elif data.startswith("filter_"):
                 await self.handle_filter_selection(client, callback_query, data)
+            elif data.startswith("edit_"):
+                await self.handle_edit_selection(client, callback_query, data)
             elif data == "back_to_main":
                 await self.handle_start(client, callback_query.message, is_edit=True) # Edit existing message
             
@@ -736,6 +439,8 @@ Bot must be admin in both channels. Use message links for start/end posts."""
                 await self.handle_button_text(client, message, state)
             elif step == "button_url":
                 await self.handle_button_url(client, message, state)
+            elif step.startswith("edit_"):
+                await self.handle_edit_input(client, message, state)
             
         except Exception as e:
             logger.error(f"Error handling text message: {e}")
@@ -1058,6 +763,30 @@ Send <code>skip</code> to use original captions.
         """
         
         await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+
+    async def handle_edit_selection(self, client: Client, callback_query: CallbackQuery, data: str):
+        """Handle a selection from the edit menu."""
+        user_id = callback_query.from_user.id
+        parts = data.split("_")
+        edit_type = parts[1]
+        job_id = parts[2]
+
+        state = {"step": f"edit_{edit_type}", "job_id": job_id}
+        self.db.save_user_state(user_id, state)
+
+        if edit_type == "job_name":
+            prompt = "Please send the new name for the job."
+        elif edit_type == "recurring_time":
+            prompt = "Please send the new recurring time in minutes (1-1440)."
+        elif edit_type == "delete_time":
+            prompt = "Please send the new delete time in minutes (0-10080)."
+        elif edit_type == "custom_caption":
+            prompt = "Please send the new custom caption. Send 'skip' to remove the caption."
+        else:
+            await callback_query.answer("Unknown edit type.", show_alert=True)
+            return
+
+        await callback_query.edit_message_text(prompt)
     
     async def handle_custom_caption(self, client: Client, message: Message, state: dict):
         """Handle custom caption input"""
@@ -1110,6 +839,56 @@ Example: <code>https://t.me/yourchannel</code>
         
         state["button_url"] = button_url
         await self.finalize_job(client, message, state)
+
+    async def handle_edit_input(self, client: Client, message: Message, state: dict):
+        """Handle user input for editing a job setting."""
+        user_id = message.from_user.id
+        job_id = state["job_id"]
+        edit_type = state["step"].split("_")[1]
+        new_value = message.text.strip()
+
+        update_data = {}
+        if edit_type == "job_name":
+            if len(new_value) < 3:
+                await message.reply_text("❌ Job name must be at least 3 characters long.")
+                return
+            update_data["job_name"] = new_value
+        elif edit_type == "recurring_time":
+            try:
+                time = int(new_value)
+                if not 1 <= time <= 1440:
+                    raise ValueError
+                update_data["recurring_time"] = time
+            except ValueError:
+                await message.reply_text("❌ Invalid time. Please enter a number between 1 and 1440.")
+                return
+        elif edit_type == "delete_time":
+            try:
+                time = int(new_value)
+                if not 0 <= time <= 10080:
+                    raise ValueError
+                update_data["delete_time"] = time
+            except ValueError:
+                await message.reply_text("❌ Invalid time. Please enter a number between 0 and 10080.")
+                return
+        elif edit_type == "custom_caption":
+            update_data["custom_caption"] = "" if new_value.lower() == "skip" else new_value
+
+        self.db.update_job(job_id, update_data)
+        self.db.clear_user_state(user_id)
+
+        await message.reply_text("✅ Job updated successfully!")
+
+        # Create a dummy callback query to pass to show_job_management
+        class DummyCallbackQuery:
+            def __init__(self, message):
+                self.message = message
+            async def answer(self, *args, **kwargs):
+                pass
+            async def edit_message_text(self, *args, **kwargs):
+                await self.message.edit_text(*args, **kwargs)
+
+        await self.show_job_management(client, DummyCallbackQuery(message), job_id)
     
     async def finalize_job(self, client: Client, message: Message, state: dict):
         """Finalize and create the job"""
@@ -1168,7 +947,7 @@ Ready to start forwarding!
         try:
             action_parts = data.split("_")
             action = action_parts[1]
-            job_id = int(action_parts[2])
+            job_id = action_parts[2]
             
             job = self.db.get_job(job_id)
             if not job:
@@ -1183,6 +962,12 @@ Ready to start forwarding!
                 await self.show_job_management(client, callback_query, job_id)
             elif action == "reset":
                 await self.reset_job_progress_action(client, callback_query, job_id)
+            elif action == "delete":
+                await self.handle_delete_job(client, callback_query, job_id)
+            elif action == "confirm_delete":
+                await self.confirm_delete_job(client, callback_query, job_id)
+            elif action == "edit":
+                await self.handle_edit_job(client, callback_query, job_id)
             
         except Exception as e:
             logger.error(f"Error in job action: {e}")
@@ -1203,6 +988,8 @@ Ready to start forwarding!
         else:
             keyboard.append([InlineKeyboardButton("▶️ Start Job", callback_data=f"job_start_{job_id}")])
         
+        keyboard.append([InlineKeyboardButton("📝 Edit Job", callback_data=f"job_edit_{job_id}"),
+                         InlineKeyboardButton("🗑️ Delete Job", callback_data=f"job_delete_{job_id}")])
         keyboard.append([InlineKeyboardButton("🔄 Reset Progress", callback_data=f"job_reset_{job_id}")])
         keyboard.extend([
             [InlineKeyboardButton("🔙 Back to Jobs", callback_data="my_jobs")]
@@ -1296,7 +1083,62 @@ Ready to start forwarding!
         await asyncio.sleep(2) # Give user time to read message
         await self.show_job_management(client, callback_query, job_id)
     
-    async def run_job(self, client: Client, job_id: int):
+    async def handle_delete_job(self, client: Client, callback_query: CallbackQuery, job_id: str):
+        """Ask for confirmation before deleting a job."""
+        job = self.db.get_job(job_id)
+        if not job:
+            await callback_query.answer("❌ Job not found.", show_alert=True)
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"job_confirm_delete_{job_id}")],
+            [InlineKeyboardButton("❌ No, Cancel", callback_data=f"job_manage_{job_id}")]
+        ])
+
+        await callback_query.edit_message_text(
+            f"❓ Are you sure you want to delete the job <b>{job['job_name']}</b>? This action cannot be undone.",
+            reply_markup=keyboard,
+            parse_mode=enums.ParseMode.HTML
+        )
+
+    async def confirm_delete_job(self, client: Client, callback_query: CallbackQuery, job_id: str):
+        """Delete the job after confirmation."""
+        job = self.db.get_job(job_id)
+        if not job:
+            await callback_query.answer("❌ Job not found.", show_alert=True)
+            return
+
+        self.db.delete_job(job_id)
+
+        await callback_query.edit_message_text(
+            f"✅ Job <b>{job['job_name']}</b> has been deleted.",
+            parse_mode=enums.ParseMode.HTML
+        )
+        await asyncio.sleep(2)
+        await self.show_user_jobs(client, callback_query)
+
+    async def handle_edit_job(self, client: Client, callback_query: CallbackQuery, job_id: str):
+        """Show the edit menu for a job."""
+        job = self.db.get_job(job_id)
+        if not job:
+            await callback_query.answer("❌ Job not found.", show_alert=True)
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Job Name", callback_data=f"edit_job_name_{job_id}")],
+            [InlineKeyboardButton("🔁 Recurring Time", callback_data=f"edit_recurring_time_{job_id}")],
+            [InlineKeyboardButton("🗑️ Delete Time", callback_data=f"edit_delete_time_{job_id}")],
+            [InlineKeyboardButton("<caption> Custom Caption", callback_data=f"edit_custom_caption_{job_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"job_manage_{job_id}")]
+        ])
+
+        await callback_query.edit_message_text(
+            f"✏️ Editing job: <b>{job['job_name']}</b>\n\nSelect a setting to edit:",
+            reply_markup=keyboard,
+            parse_mode=enums.ParseMode.HTML
+        )
+
+    async def run_job(self, client: Client, job_id: str):
         """Main job execution loop"""
         logger.info(f"Starting job {job_id}")
         
